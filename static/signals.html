@@ -1,0 +1,139 @@
+<!doctype html>
+<html lang="zh-CN">
+<meta charset="utf-8">
+<title>安全信号处置台</title>
+<style>
+body{font:15px system-ui;max-width:1180px;margin:32px auto;padding:0 20px;background:#f5f7fa;color:#172033}
+section{background:#fff;padding:20px;margin:16px 0;border-radius:12px;box-shadow:0 2px 12px #0001}
+input,textarea,select,button{font:inherit;padding:8px;margin:4px;box-sizing:border-box}
+input,textarea,select{width:auto;min-width:140px}
+button{background:#174ea6;color:#fff;border:0;border-radius:6px;cursor:pointer}
+button.secondary{background:#5f6b7a}
+button.danger{background:#b3261e}
+table{border-collapse:collapse;width:100%;margin-top:8px}
+th,td{border:1px solid #e3e8ef;padding:8px;text-align:left;vertical-align:top}
+th{background:#eef2f8}
+tr.overdue{background:#fdecea}
+.badge{display:inline-block;padding:2px 8px;border-radius:10px;font-size:12px;margin-right:4px}
+.b-open{background:#fff4d6}.b-confirmed{background:#d8f0de}.b-rejected{background:#eceff3;color:#5f6b7a}
+.b-fatal{background:#b3261e;color:#fff}.b-late{background:#b3261e;color:#fff}
+#msg{color:#b3261e;white-space:pre-wrap}
+a{color:#174ea6}
+</style>
+<h1>安全信号处置台</h1>
+<p><a href="/">返回案例台</a>。页面只做展示与操作；信号数据由后端表维护，判定阈值由后端 <code>SignalRules</code> 维护。</p>
+<section>
+  <h2>身份</h2>
+  用户 <input id="user" value="medical-1">
+  角色 <select id="role"><option>medical_reviewer</option><option>regional_lead</option><option>global_admin</option></select>
+  区域 <input id="region" value="CN" placeholder="区域角色必填">
+  <button onclick="loadSignals()">刷新信号</button>
+  <button onclick="scan()">执行信号检查</button>
+  <span id="msg"></span>
+</section>
+<section>
+  <h2>信号列表</h2>
+  <p>区域负责人只看本区域涉及的信号；医学审核员和全局管理员可跨区。红色行为含逾期未完成措施。</p>
+  <table>
+    <thead><tr><th>编号</th><th>产品 / 事件词</th><th>状态</th><th>有效例数</th><th>严重</th><th>死亡</th>
+      <th>涉及区域</th><th>触发依据</th><th>最近检出</th><th></th></tr></thead>
+    <tbody id="rows"></tbody>
+  </table>
+</section>
+<section id="detail" style="display:none">
+  <h2>信号 <span id="d-no"></span></h2>
+  <div id="d-summary"></div>
+  <h3>判定与处置记录</h3>
+  <div id="d-decision-box"></div>
+  <div id="d-actions"></div>
+  <h3>证据案例（已合并来源跟随目标案例，不重复计数）</h3>
+  <div id="d-evidence"></div>
+</section>
+<script>
+let current = null;
+function headers(){
+  const h = {'X-User-Id':user.value.trim(),'X-Role':role.value};
+  if(region.value.trim()) h['X-Region']=region.value.trim();
+  return h;
+}
+function esc(s){return String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
+async function api(method,url,body){
+  const opt={method,headers:{...headers(),'Content-Type':'application/json'}};
+  if(body) opt.body=JSON.stringify(body);
+  const r=await fetch(url,opt), data=await r.json();
+  if(!r.ok){msg.textContent=`[${data.error}] ${data.message}`;throw data;}
+  msg.textContent='';return data;
+}
+const STATUS_TXT={open:'待判定',confirmed:'已确认',rejected:'已驳回'};
+const REASON_TXT={case_threshold:'达到3例',fatal:'出现死亡'};
+async function loadSignals(){
+  const {signals}=await api('GET','/api/signals');
+  rows.innerHTML=signals.map(s=>`<tr class="${s.has_overdue?'overdue':''}">
+    <td>${esc(s.signal_no)}</td>
+    <td>${esc(s.product)} / ${esc(s.event_term)}</td>
+    <td><span class="badge b-${s.status}">${STATUS_TXT[s.status]}</span></td>
+    <td>${s.case_count}</td><td>${s.serious_count}</td>
+    <td>${s.fatal_count>0?'<span class="badge b-fatal">'+s.fatal_count+'</span>':0}</td>
+    <td>${(JSON.parse(s.regions_json)).map(esc).join('、')}</td>
+    <td>${(JSON.parse(s.trigger_reasons_json)).map(r=>REASON_TXT[r]||r).join('、')}</td>
+    <td>${esc(s.last_detected_at)}</td>
+    <td><button onclick="openSignal(${s.id})">查看</button></td>
+  </tr>`).join('') || '<tr><td colspan="10">暂无信号（先执行信号检查）</td></tr>';
+  if(current) openSignal(current.id,true);
+}
+async function scan(){
+  const r=await api('POST','/api/signals/scan',{});
+  msg.textContent=`检查 ${r.checked_groups} 个组合，新建 ${r.created.length} 条，刷新 ${r.refreshed.length} 条`;
+  loadSignals();
+}
+async function openSignal(id,keep){
+  const d=await api('GET',`/api/signals/${id}`);current=d.signal;detail.style.display='';
+  const s=d.signal;
+  dNo.textContent=s.signal_no;
+  dSummary.innerHTML=`<p><b>${esc(s.product)} / ${esc(s.event_term)}</b>
+    <span class="badge b-${s.status}">${STATUS_TXT[s.status]}</span></p>
+    <p>有效案例 ${s.case_count}（严重 ${s.serious_count}，死亡 ${s.fatal_count}）；涉及区域 ${JSON.parse(s.regions_json).map(esc).join('、')}
+    ；首次检出 ${esc(s.first_detected_at)}，最近检出 ${esc(s.last_detected_at)}</p>`;
+  dDecisionBox.innerHTML=d.decisions.length?`<table><tr><th>判定</th><th>依据</th><th>审核员</th><th>时间</th></tr>`+
+    d.decisions.map(x=>`<tr><td>${STATUS_TXT[x.decision]}</td><td>${esc(x.rationale)}</td><td>${esc(x.reviewer)}</td><td>${esc(x.created_at)}</td></tr>`).join('')+'</table>':
+    '<p>尚无判定。</p>';
+  if(s.status==='open')
+    dDecisionBox.innerHTML+=`<p><textarea id="rationale" rows="2" placeholder="判定依据（必填）" style="width:60%;vertical-align:middle"></textarea>
+      <button class="secondary" onclick="decide('confirmed')">确认信号</button>
+      <button class="danger" onclick="decide('rejected')">驳回信号</button></p>`;
+  const actions=d.actions.map(a=>`<tr class="${a.overdue?'overdue':''}">
+      <td>${esc(a.measure)}</td><td>${esc(a.owner)}</td><td>${esc(a.due_at)}${a.overdue?' <span class="badge b-late">已逾期</span>':''}</td>
+      <td>${a.completed_at?('已完成 '+esc(a.completed_at)):'进行中'}</td><td>${esc(a.registered_by)}</td>
+      <td>${a.completed_at?'':`<button onclick="completeAction(${a.id})">完成</button>`}</td></tr>`).join('');
+  dActions.innerHTML=`<table><tr><th>措施</th><th>负责人</th><th>期限</th><th>状态</th><th>登记人</th><th></th></tr>${actions}</table>`;
+  if(s.status==='confirmed')
+    dActions.innerHTML+=`<p><input id="m" placeholder="措施" style="width:34%"><input id="o" placeholder="负责人" style="width:18%">
+      <input id="due" type="date"><button onclick="registerAction()">登记措施</button></p>`;
+  dEvidence.innerHTML=`<table><tr><th>案例号</th><th>患者</th><th>区域</th><th>严重/死亡</th><th>关联性</th>
+    <th>来源</th><th>已合并来源案例（跟随本案例）</th><th>接收时间</th></tr>`+
+    d.evidence.map(e=>`<tr><td>${esc(e.case_no)}</td><td>${esc(e.patient_ref)}</td><td>${esc(e.region)}</td>
+      <td>${e.serious?'严重':''} ${e.fatal?'<span class="badge b-fatal">死亡</span>':''}</td>
+      <td>${esc(e.causality||'')}</td><td>${e.sources.map(esc).join('、')}</td>
+      <td>${e.merged_sources.map(x=>esc(x.case_no)+'('+esc(x.region)+')').join('、')||'—'}</td>
+      <td>${esc(e.received_at)}</td></tr>`).join('')+'</table>'+
+    `<p>服务端时间 ${esc(d.server_time)}；逾期按该时间与措施期限比较。</p>`;
+}
+async function decide(decision){
+  const rationale=document.getElementById('rationale').value.trim();
+  if(!rationale){msg.textContent='判定依据必填';return;}
+  await api('POST',`/api/signals/${current.id}/decision`,{decision,rationale});
+  openSignal(current.id);loadSignals();
+}
+async function registerAction(){
+  const measure=m.value.trim(),owner=o.value.trim(),due_at=due.value;
+  if(!measure||!owner||!due_at){msg.textContent='措施、负责人和期限必填';return;}
+  await api('POST',`/api/signals/${current.id}/actions`,{measure,owner,due_at});
+  openSignal(current.id);loadSignals();
+}
+async function completeAction(aid){
+  await api('POST',`/api/signals/${current.id}/actions/${aid}/complete`,{});
+  openSignal(current.id);loadSignals();
+}
+loadSignals();
+</script>
+</html>

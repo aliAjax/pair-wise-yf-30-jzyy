@@ -167,6 +167,10 @@ class Repository:
 class PharmacovigilanceService:
     def __init__(self, db_path: str | Path):
         self.repo = Repository(db_path)
+        # 信号数据独立建表，规则与页面分别由 signals.py 与 static/signals.html 维护
+        from signals import init_signal_schema
+
+        init_signal_schema(self.repo.conn)
 
     @staticmethod
     def identity(headers: Any) -> tuple[str, str, str]:
@@ -437,7 +441,15 @@ class Handler(BaseHTTPRequestHandler):
             return 200, {"cases": self.service.list_cases(role, region, query)}
         if path == "/api/overdue":
             return 200, {"reports": self.service.overdue(role, region)}
+        if path == "/api/signals":
+            from signals import list_signals
+
+            return 200, {"signals": list_signals(self.service.repo, role, region)}
         parts = [part for part in path.split("/") if part]
+        if len(parts) == 3 and parts[:2] == ["api", "signals"] and parts[2].isdigit():
+            from signals import get_signal
+
+            return 200, get_signal(self.service.repo, int(parts[2]), role, region)
         if len(parts) == 3 and parts[:2] == ["api", "cases"] and parts[2].isdigit():
             return 200, self.service.get_case(int(parts[2]), role, region)
         raise ApiError(404, "not_found", "接口不存在")
@@ -448,7 +460,27 @@ class Handler(BaseHTTPRequestHandler):
             return 201, self.service.create_case(actor, role, region, body)
         if path == "/api/escalate-overdue":
             return 200, self.service.escalate_overdue(actor, role, region)
+        if path == "/api/signals/scan":
+            from signals import scan
+
+            return 200, scan(self.service.repo, actor, role)
         parts = [part for part in path.split("/") if part]
+        if (len(parts) == 6 and parts[:2] == ["api", "signals"]
+                and parts[2].isdigit() and parts[3] == "actions" and parts[4].isdigit()
+                and parts[5] == "complete"):
+            from signals import complete_action
+
+            return 200, complete_action(self.service.repo, int(parts[4]), actor, role, region)
+        if len(parts) == 4 and parts[:2] == ["api", "signals"] and parts[2].isdigit():
+            signal_id, action = int(parts[2]), parts[3]
+            if action == "decision":
+                from signals import decide
+
+                return 200, decide(self.service.repo, signal_id, actor, role, body)
+            if action == "actions":
+                from signals import register_action
+
+                return 201, register_action(self.service.repo, signal_id, actor, role, region, body)
         if len(parts) == 4 and parts[:2] == ["api", "cases"] and parts[2].isdigit():
             case_id, action = int(parts[2]), parts[3]
             if action == "followups":
@@ -468,6 +500,14 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if method == "GET" and parsed.path == "/":
                 page = (self.web_root / "index.html").read_bytes()
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(page)))
+                self.end_headers()
+                self.wfile.write(page)
+                return
+            if method == "GET" and parsed.path == "/signals.html":
+                page = (self.web_root / "signals.html").read_bytes()
                 self.send_response(200)
                 self.send_header("Content-Type", "text/html; charset=utf-8")
                 self.send_header("Content-Length", str(len(page)))

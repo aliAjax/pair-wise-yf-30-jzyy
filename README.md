@@ -24,6 +24,24 @@ python3 app.py --db pharmacovigilance.db
 - `POST /api/cases/{id}/merge`：全局管理员合并重复案例。
 - `POST /api/escalate-overdue`、`GET /api/overdue`：逾期检查与升级。
 
+## 安全信号处置
+
+信号数据、判定规则和页面操作分开维护：数据在 `signals/signals_decisions/signal_actions` 表，
+规则集中在 `signals.py` 的 `SignalRules`（默认：同产品+同事件词有效案例达到 3 例，或出现 1 例死亡即建立信号），
+页面为 `static/signals.html`。
+
+- 归并口径：按归一化后的产品名和事件词分组，只统计有效案例（`status != 'merged'`）。
+  已合并来源案例跟随目标案例（intakes 合并时迁移），不重复计数。
+- `POST /api/signals/scan`：医学审核员/全局管理员执行检查；重复扫描不产生第二份信号，只刷新统计。
+- `GET /api/signals`、`GET /api/signals/{id}`：查看信号、证据案例和处置记录。
+  区域负责人只看本区域涉及的信号及其证据，全局管理员和医学审核员可跨区。
+- `POST /api/signals/{id}/decision`：医学审核员确认（confirmed）或驳回（rejected），必须填写依据，且只能判定一次。
+- `POST /api/signals/{id}/actions`：确认后由区域负责人/全局管理员登记措施、负责人和期限；
+  `POST /api/signals/{id}/actions/{aid}/complete` 标记完成（幂等）。
+  期限按 UTC 当天 23:59:59 截止，逾期未完成的措施在列表和页面标红提醒。
+- 页面入口：`/signals.html`。
+
+
 ## 测试
 
 ```bash
