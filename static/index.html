@@ -1,5 +1,228 @@
-<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>药物警戒案例台</title>
-<style>body{font:15px system-ui;max-width:1080px;margin:40px auto;padding:0 20px;background:#f5f7fa;color:#172033}section{background:white;padding:20px;margin:16px 0;border-radius:12px;box-shadow:0 2px 12px #0001}input,textarea,button{font:inherit;padding:8px;margin:4px}input,textarea{width:70%}button{background:#174ea6;color:white;border:0;border-radius:6px}pre{background:#111827;color:#d1fae5;padding:14px;overflow:auto}</style>
-<h1>药物警戒案例台</h1><p>标准库 JSON API 概览。请求需带 X-User-Id、X-Role；区域角色还需 X-Region。</p>
-<section><h2>快速查看</h2><input id="user" value="global-admin"><input id="role" value="global_admin"><button onclick="load()">刷新案例</button><pre id="out"></pre></section>
-<script>async function load(){let h={'X-User-Id':user.value,'X-Role':role.value};let r=await fetch('/api/state',{headers:h});out.textContent=JSON.stringify(await r.json(),null,2)}load()</script>
+<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>药物警戒安全信号台</title>
+<style>
+body{font:15px system-ui;max-width:1180px;margin:32px auto;padding:0 20px;background:#f5f7fa;color:#172033}
+h1{margin-bottom:4px}
+section{background:white;padding:18px 20px;margin:14px 0;border-radius:12px;box-shadow:0 2px 12px #0001}
+input,textarea,select,button{font:inherit;padding:7px 9px;margin:3px 4px 3px 0;box-sizing:border-box}
+input,textarea,select{border:1px solid #cbd2dc;border-radius:6px;background:#fff}
+input.w,textarea.w{width:100%}
+button{background:#174ea6;color:white;border:0;border-radius:6px;cursor:pointer}
+button.ghost{background:#e8eef8;color:#174ea6}
+button.danger{background:#b3261e}
+button.ok{background:#1e7d32}
+button:disabled{background:#9aa5b5;cursor:not-allowed}
+table{border-collapse:collapse;width:100%;font-size:14px}
+th,td{border-bottom:1px solid #e6eaf0;text-align:left;padding:7px 8px;vertical-align:top}
+th{background:#f0f3f8}
+.badge{display:inline-block;padding:1px 8px;border-radius:10px;font-size:12px;margin-right:4px}
+.b-open{background:#fff3cd;color:#8a6100}
+.b-confirmed{background:#fde0e0;color:#b3261e}
+.b-rejected{background:#e6e6e6;color:#555}
+.b-fatal{background:#b3261e;color:#fff}
+.b-serious{background:#f0a000;color:#fff}
+.b-region{background:#e3edff;color:#174ea6}
+.overdue{background:#fdecea;border:1px solid #f5b4ae;color:#b3261e;padding:10px 14px;border-radius:8px;font-weight:600}
+.muted{color:#6b7686;font-size:13px}
+.row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
+.signal-card{border:1px solid #dde3ec;border-radius:10px;padding:12px 14px;margin:10px 0;cursor:pointer}
+.signal-card:hover{border-color:#174ea6}
+.signal-card.sel{border-color:#174ea6;box-shadow:0 0 0 2px #174ea633}
+pre{background:#111827;color:#d1fae5;padding:12px;overflow:auto;border-radius:8px;max-height:340px}
+#msg{margin:8px 0;font-weight:600}
+.err{color:#b3261e}.good{color:#1e7d32}
+label{font-size:13px;color:#3c4658;font-weight:600}
+</style>
+<h1>药物警戒安全信号台</h1>
+<p class="muted">按产品 + 事件词归并有效案例（已合并来源只跟随目标案例）；同组合满 3 例或出现死亡即建立信号。请求需带 X-User-Id、X-Role；区域角色还需 X-Region。</p>
+<section>
+  <div class="row">
+    <label>用户<input id="user" value="global-admin" style="width:130px"></label>
+    <label>角色<select id="role">
+      <option value="medical_reviewer">医学审核员</option>
+      <option value="regional_lead">区域负责人</option>
+      <option value="global_admin" selected>全局管理员</option>
+      <option value="reporter">报告人</option>
+    </select></label>
+    <label>区域<input id="region" value="" placeholder="如 CN/US" style="width:100px"></label>
+    <button onclick="loadAll()">刷新</button>
+    <button id="scanBtn" onclick="scan()">检查安全信号</button>
+    <span id="identityHint" class="muted"></span>
+  </div>
+  <div id="msg"></div>
+</section>
+<div id="overdueBox" class="overdue" style="display:none"></div>
+<section>
+  <h2>信号列表 <span id="sigCount" class="muted"></span></h2>
+  <div id="signalList"><p class="muted">加载中…</p></div>
+</section>
+<section id="detailSec" style="display:none">
+  <h2 id="dTitle">信号详情</h2>
+  <div id="detail"></div>
+</section>
+<script>
+const $=id=>document.getElementById(id);
+let SIGNALS=[], SELECTED=null, SERVER_TIME=null;
+function headers(){
+  const h={'X-User-Id':$('user').value.trim(),'X-Role':$('role').value,'Content-Type':'application/json'};
+  if($('region').value.trim())h['X-Region']=$('region').value.trim();
+  return h;
+}
+function role(){return $('role').value;}
+function canAct(){return role()==='medical_reviewer'||role()==='global_admin';}
+function msg(text,ok){$('msg').innerHTML=text?`<span class="${ok?'good':'err'}">${text}</span>`:'';if(text)setTimeout(()=>msg(''),5000);}
+function esc(s){return String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));}
+function fmt(t){return t?esc(t).replace('T',' ').replace('Z',' UTC'):'';}
+async function api(method,url,body){
+  const opt={method,headers:headers()};
+  if(body)opt.body=JSON.stringify(body);
+  const r=await fetch(url,opt), data=await r.json();
+  if(!r.ok)throw new Error(data.message||data.error||('HTTP '+r.status));
+  return data;
+}
+async function loadAll(){
+  msg('');
+  $('scanBtn').style.display=canAct()?'inline-block':'none';
+  $('identityHint').textContent = role()==='regional_lead'
+    ? '区域负责人只能查看本区域涉及的信号与证据'
+    : (canAct()?'医学审核员/全局管理员可跨区处置':'报告人无权访问信号数据');
+  try{
+    const data=await api('GET','/api/signals');
+    SIGNALS=data.signals; SERVER_TIME=data.server_time;
+    $('sigCount').textContent=`共 ${SIGNALS.length} 条 · 服务时间 ${fmt(data.server_time)}`;
+    const overdue=SIGNALS.filter(s=>s.overdue);
+    const box=$('overdueBox');
+    if(overdue.length){
+      box.style.display='block';
+      box.innerHTML=`⚠ 逾期提醒：${overdue.length} 条信号存在逾期未完成措施：`+
+        overdue.map(s=>` <a href="#detailSec" onclick="openSignal(${s.id})">${esc(s.signal_no)}</a>`).join('、');
+    }else box.style.display='none';
+    renderList();
+    if(SELECTED)await openSignal(SELECTED);
+  }catch(e){msg(e.message,false);}
+}
+async function scan(){
+  try{
+    const r=await api('POST','/api/signals/scan');
+    msg(`检查完成：新建 ${r.created_count} 条信号，刷新 ${r.updated_count} 条已有信号的证据`,true);
+    SELECTED=null;await loadAll();
+  }catch(e){msg(e.message,false);}
+}
+function statusBadge(s){
+  return {open:'<span class="badge b-open">待判定</span>',
+          confirmed:'<span class="badge b-confirmed">已确认</span>',
+          rejected:'<span class="badge b-rejected">已驳回</span>'}[s]||s;
+}
+function renderList(){
+  if(!SIGNALS.length){$('signalList').innerHTML='<p class="muted">暂无可查看的信号。</p>';return;}
+  $('signalList').innerHTML=SIGNALS.map(s=>`
+    <div class="signal-card ${SELECTED===s.id?'sel':''}" onclick="openSignal(${s.id})">
+      <div class="row" style="justify-content:space-between">
+        <strong>${esc(s.signal_no)} · ${esc(s.product)} / ${esc(s.event_term)}</strong>
+        <span>${statusBadge(s.status)}${s.overdue?'<span class="badge b-fatal">措施逾期</span>':''}</span>
+      </div>
+      <div class="muted" style="margin-top:6px">
+        有效案例 <strong>${s.case_count}</strong> ·
+        严重 <strong>${s.serious_count}</strong> ·
+        死亡 <strong style="color:#b3261e">${s.fatal_count}</strong> ·
+        ${s.regions.map(r=>`<span class="badge b-region">${esc(r)}</span>`).join('')}
+        ${s.open_action_count?` · 未结措施 ${s.open_action_count}`:''}
+        <br>命中规则：${(s.rules.matched_rules||[]).map(ruleName).join('、')}
+      </div>
+    </div>`).join('');
+}
+function ruleName(r){return {fatal_outcome:'出现死亡',case_count_threshold:'案例数 ≥ 3'}[r]||r;}
+async function openSignal(id){
+  SELECTED=id;renderList();
+  try{
+    const d=await api('GET',`/api/signals/${id}`), s=d.signal;
+    $('detailSec').style.display='block';
+    $('dTitle').innerHTML=`${esc(s.signal_no)} · ${esc(s.product)} / ${esc(s.event_term)} ${statusBadge(s.status)}`;
+    const regionNote = d.evidence_total!==d.evidence.length
+      ? `<p class="muted">你是区域负责人，仅显示本区域 ${d.evidence.length} 条证据；该信号共 ${d.evidence_total} 条。</p>`:'';
+    $('detail').innerHTML=`
+      <p class="muted">建立 ${fmt(s.created_at)}；最近更新 ${fmt(s.updated_at)}；命中规则：${(s.rules.matched_rules||[]).map(ruleName).join('、')}（阈值快照 ${esc(JSON.stringify(s.rules.thresholds||{}))}）</p>
+      <h3>证据案例（${d.evidence.length}/${d.evidence_total}）</h3>${regionNote}
+      <table><thead><tr><th>案例</th><th>区域</th><th>严重</th><th>死亡</th><th>接收时间</th></tr></thead><tbody>
+      ${d.evidence.map(e=>`<tr><td><a href="/api/cases/${e.case_id}" target="_blank">${esc(e.case_no)}</a></td>
+        <td>${esc(e.region)}</td>
+        <td>${e.serious?'<span class="badge b-serious">严重</span>':'否'}</td>
+        <td>${e.fatal?'<span class="badge b-fatal">死亡</span>':'否'}</td>
+        <td>${fmt(e.received_at)}</td></tr>`).join('')}
+      </tbody></table>
+      <h3>判定记录</h3>
+      ${d.decisions.length?`<table><thead><tr><th>结论</th><th>依据</th><th>审核员</th><th>时间</th></tr></thead><tbody>
+        ${d.decisions.map(x=>`<tr><td>${x.decision==='confirmed'?'<span class="badge b-confirmed">确认</span>':'<span class="badge b-rejected">驳回</span>'}</td>
+          <td>${esc(x.rationale)}</td><td>${esc(x.reviewer)}</td><td>${fmt(x.created_at)}</td></tr>`).join('')}
+      </tbody></table>`:'<p class="muted">尚未判定。</p>'}
+      ${decisionForm(s)}
+      <h3>处置措施</h3>
+      ${d.actions.length?`<table><thead><tr><th>措施</th><th>负责人</th><th>期限</th><th>状态</th><th>操作</th></tr></thead><tbody>
+        ${d.actions.map(a=>`<tr style="${a.overdue?'background:#fdecea':''}">
+          <td>${esc(a.measure)}${a.overdue?' <span class="badge b-fatal">逾期</span>':''}</td>
+          <td>${esc(a.owner)}</td><td>${fmt(a.due_at)}</td>
+          <td>${a.status==='completed'?'<span class="badge b-rejected">已完成 '+fmt(a.completed_at)+'</span>':'进行中'}</td>
+          <td>${(a.status!=='completed'&&canAct())?`<button class="ok" onclick="completeAction(${a.id})">标记完成</button>`:''}</td>
+        </tr>`).join('')}
+      </tbody></table>`:'<p class="muted">暂无措施。</p>'}
+      ${(s.status==='confirmed'&&canAct())?registerForm():(s.status==='open'?'':'<p class="muted">只有已确认信号可登记措施。</p>')}
+      <h3>处置留痕</h3>
+      <table><thead><tr><th>时间</th><th>操作人</th><th>角色</th><th>动作</th><th>详情</th></tr></thead><tbody>
+      ${d.audit.map(a=>`<tr><td>${fmt(a.created_at)}</td><td>${esc(a.actor)}</td><td>${esc(a.role)}</td>
+        <td>${esc(a.action)}</td><td class="muted">${esc(a.detail_json)}</td></tr>`).join('')}
+      </tbody></table>`;
+  }catch(e){msg(e.message,false);}
+}
+function decisionForm(s){
+  if(s.status!=='open')return '';
+  if(!canAct())return '<p class="muted">待医学审核员或全局管理员判定。</p>';
+  return `<h3>医学判定</h3>
+    <label>结论</label><br>
+    <label><input type="radio" name="dec" value="confirmed" checked onchange="toggleDec()"> 确认信号</label>
+    <label><input type="radio" name="dec" value="rejected" onchange="toggleDec()"> 驳回</label>
+    <textarea id="decRationale" class="w" rows="2" placeholder="判定依据（必填）"></textarea>
+    <div id="actionFields">
+      <p class="muted">确认后可同时登记首条措施，也可稍后在下方登记：</p>
+      <input id="decMeasure" placeholder="措施（如 更新说明书/发医务函）" class="w">
+      <div class="row"><input id="decOwner" placeholder="负责人"><input id="decDue" type="datetime-local"></div>
+    </div>
+    <button onclick="submitDecision(${s.id})">提交判定</button>`;
+}
+function toggleDec(){
+  const confirmed=document.querySelector('input[name=dec]:checked').value==='confirmed';
+  $('actionFields').style.display=confirmed?'block':'none';
+}
+function registerForm(){
+  return `<h3>登记措施</h3>
+    <input id="newMeasure" placeholder="措施" class="w">
+    <div class="row"><input id="newOwner" placeholder="负责人"><input id="newDue" type="datetime-local"></div>
+    <button onclick="submitAction(${SELECTED})">登记措施</button>`;
+}
+async function submitDecision(id){
+  const decision=document.querySelector('input[name=dec]:checked').value;
+  const rationale=$('decRationale').value.trim();
+  if(!rationale){msg('确认或驳回必须填写判定依据',false);return;}
+  const body={decision,rationale};
+  if(decision==='confirmed'&&$('decMeasure').value.trim()){
+    if(!$('decOwner').value.trim()||!$('decDue').value){msg('登记措施需同时填写负责人和期限',false);return;}
+    body.measure=$('decMeasure').value.trim();
+    body.owner=$('decOwner').value.trim();
+    body.due_at=new Date($('decDue').value).toISOString();
+  }
+  try{await api('POST',`/api/signals/${id}/decision`,body);msg('判定已提交',true);await loadAll();}
+  catch(e){msg(e.message,false);}
+}
+async function submitAction(id){
+  const measure=$('newMeasure').value.trim(),owner=$('newOwner').value.trim();
+  if(!measure||!owner||!$('newDue').value){msg('措施、负责人、期限均必填',false);return;}
+  try{
+    await api('POST',`/api/signals/${id}/actions`,{measure,owner,due_at:new Date($('newDue').value).toISOString()});
+    msg('措施已登记',true);await openSignal(id);
+  }catch(e){msg(e.message,false);}
+}
+async function completeAction(aid){
+  try{await api('POST',`/api/signal-actions/${aid}/complete`,{});msg('措施已标记完成',true);await loadAll();}
+  catch(e){msg(e.message,false);}
+}
+$('role').onchange=()=>{SELECTED=null;$('detailSec').style.display='none';loadAll();};
+loadAll();
+</script>

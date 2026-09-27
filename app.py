@@ -13,6 +13,8 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
+import signal_rules
+
 PORT = 8201
 ROLES = {"reporter", "regional_lead", "medical_reviewer", "global_admin"}
 
@@ -143,6 +145,7 @@ class Repository:
             CREATE TABLE IF NOT EXISTS audit_log (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 case_id INTEGER,
+                signal_id INTEGER,
                 actor TEXT NOT NULL,
                 role TEXT NOT NULL,
                 action TEXT NOT NULL,
@@ -151,12 +154,18 @@ class Repository:
             );
             """
         )
+        from signals import SignalStore
+        SignalStore(self.conn).init_schema()
+        columns = {row[1] for row in self.conn.execute("PRAGMA table_info(audit_log)")}
+        if "signal_id" not in columns:
+            self.conn.execute("ALTER TABLE audit_log ADD COLUMN signal_id INTEGER")
 
     @staticmethod
-    def audit(conn: sqlite3.Connection, case_id: int | None, actor: str, role: str, action: str, detail: dict[str, Any]) -> None:
+    def audit(conn: sqlite3.Connection, actor: str, role: str, action: str, detail: dict[str, Any],
+              case_id: int | None = None, signal_id: int | None = None) -> None:
         conn.execute(
-            "INSERT INTO audit_log(case_id,actor,role,action,detail_json,created_at) VALUES(?,?,?,?,?,?)",
-            (case_id, actor, role, action, json.dumps(detail, ensure_ascii=False, sort_keys=True), iso()),
+            "INSERT INTO audit_log(case_id,signal_id,actor,role,action,detail_json,created_at) VALUES(?,?,?,?,?,?,?)",
+            (case_id, signal_id, actor, role, action, json.dumps(detail, ensure_ascii=False, sort_keys=True), iso()),
         )
 
     @staticmethod
@@ -166,7 +175,9 @@ class Repository:
 
 class PharmacovigilanceService:
     def __init__(self, db_path: str | Path):
+        from signals import SignalStore
         self.repo = Repository(db_path)
+        self.signals = SignalStore(self.repo.conn)
 
     @staticmethod
     def identity(headers: Any) -> tuple[str, str, str]:
@@ -207,7 +218,7 @@ class PharmacovigilanceService:
             duplicate = conn.execute("SELECT * FROM intakes WHERE dedupe_key=?", (body["dedupe_key"],)).fetchone()
             if duplicate:
                 case = self._case(conn, duplicate["case_id"])
-                Repository.audit(conn, case["id"], actor, role, "intake_deduplicated", {"dedupe_key": body["dedupe_key"], "source": body["source"]})
+                Repository.audit(conn, actor, role, "intake_deduplicated", {"dedupe_key": body["dedupe_key"], "source": body["source"]}, case_id=case["id"])
                 return {"deduplicated": True, "case": dict(case), "intake_id": duplicate["id"]}
             count = conn.execute("SELECT COUNT(*) FROM cases").fetchone()[0] + 1
             case_no = body.get("case_no") or f"PV-{received.year}-{count:06d}"
@@ -227,7 +238,7 @@ class PharmacovigilanceService:
                 "INSERT INTO intakes(case_id,source,dedupe_key,payload_json,received_at,created_by,created_at) VALUES(?,?,?,?,?,?,?)",
                 (case_id, body["source"], body["dedupe_key"], json.dumps(body, ensure_ascii=False, sort_keys=True), iso(received), actor, now),
             )
-            Repository.audit(conn, case_id, actor, role, "case_created", {"case_no": case_no, "source": body["source"]})
+            Repository.audit(conn, actor, role, "case_created", {"case_no": case_no, "source": body["source"]}, case_id=case_id)
             case = self._case(conn, case_id)
             return {"deduplicated": False, "case": dict(case)}
 
@@ -284,7 +295,7 @@ class PharmacovigilanceService:
                 "UPDATE cases SET revision=?,received_at=?,report_due_at=?,updated_at=? WHERE id=?",
                 (revision, iso(received), iso(due), iso(), case_id),
             )
-            Repository.audit(conn, case_id, actor, role, "followup_added", {"revision": revision, "source": source})
+            Repository.audit(conn, actor, role, "followup_added", {"revision": revision, "source": source}, case_id=case_id)
             return {"case": dict(self._case(conn, case_id)), "revision": revision}
 
     def medical_review(self, case_id: int, actor: str, role: str, body: dict[str, Any]) -> dict[str, Any]:
@@ -319,7 +330,7 @@ class PharmacovigilanceService:
                    VALUES(?,?,?,?,?,?,?,?)""",
                 (case_id, expected, int(serious), int(fatal), causality, rationale, actor, iso()),
             )
-            Repository.audit(conn, case_id, actor, role, "medical_reviewed", {"from_revision": expected, "serious": serious, "fatal": fatal, "causality": causality})
+            Repository.audit(conn, actor, role, "medical_reviewed", {"from_revision": expected, "serious": serious, "fatal": fatal, "causality": causality}, case_id=case_id)
             return {"case": dict(self._case(conn, case_id)), "reviewed_revision": expected}
 
     def create_report(self, case_id: int, actor: str, role: str, region: str, body: dict[str, Any]) -> dict[str, Any]:
@@ -337,7 +348,7 @@ class PharmacovigilanceService:
                 cur = conn.execute("INSERT INTO reports(case_id,country,due_at,status) VALUES(?,?,?,?)", (case_id, country, iso(due), "pending"))
             except sqlite3.IntegrityError as exc:
                 raise ApiError(409, "report_exists", "该国家报告已经存在") from exc
-            Repository.audit(conn, case_id, actor, role, "report_created", {"report_id": cur.lastrowid, "country": country})
+            Repository.audit(conn, actor, role, "report_created", {"report_id": cur.lastrowid, "country": country}, case_id=case_id)
             return dict(conn.execute("SELECT * FROM reports WHERE id=?", (cur.lastrowid,)).fetchone())
 
     def submit_report(self, report_id: int, actor: str, role: str, region: str, body: dict[str, Any]) -> dict[str, Any]:
@@ -354,7 +365,7 @@ class PharmacovigilanceService:
             now = parse_time(body.get("submitted_at"), utcnow())
             late = int(now > parse_time(row["due_at"]))
             conn.execute("UPDATE reports SET status='submitted',submitted_at=?,submitted_by=?,late=? WHERE id=?", (iso(now), actor, late, report_id))
-            Repository.audit(conn, row["case_id"], actor, role, "report_submitted", {"report_id": report_id, "country": row["country"], "late": bool(late)})
+            Repository.audit(conn, actor, role, "report_submitted", {"report_id": report_id, "country": row["country"], "late": bool(late)}, case_id=row["case_id"])
             return {"report": dict(conn.execute("SELECT * FROM reports WHERE id=?", (report_id,)).fetchone()), "idempotent": False}
 
     def merge_cases(self, source_id: int, actor: str, role: str, body: dict[str, Any]) -> dict[str, Any]:
@@ -372,8 +383,8 @@ class PharmacovigilanceService:
                 raise ApiError(409, "merge_conflict", "目标案例不可用，或产品与来源案例不一致")
             conn.execute("UPDATE cases SET status='merged',merged_into=?,revision=revision+1,updated_at=? WHERE id=?", (target_id, iso(), source_id))
             conn.execute("UPDATE intakes SET case_id=? WHERE case_id=?", (target_id, source_id))
-            Repository.audit(conn, target_id, actor, role, "case_merged_in", {"source_case_id": source_id})
-            Repository.audit(conn, source_id, actor, role, "case_merged_into", {"target_case_id": target_id})
+            Repository.audit(conn, actor, role, "case_merged_in", {"source_case_id": source_id}, case_id=target_id)
+            Repository.audit(conn, actor, role, "case_merged_into", {"target_case_id": target_id}, case_id=source_id)
             return {"case": dict(self._case(conn, source_id)), "idempotent": False}
 
     def overdue(self, role: str, region: str) -> list[dict[str, Any]]:
@@ -391,12 +402,209 @@ class PharmacovigilanceService:
         with self.repo.tx() as conn:
             for row in rows:
                 conn.execute("UPDATE reports SET status='overdue' WHERE id=? AND status='pending'", (row["id"],))
-                Repository.audit(conn, row["case_id"], actor, role, "report_overdue_escalated", {"report_id": row["id"], "country": row["country"]})
+                Repository.audit(conn, actor, role, "report_overdue_escalated", {"report_id": row["id"], "country": row["country"]}, case_id=row["case_id"])
         return {"escalated": len(rows)}
+
+    @staticmethod
+    def signal_region_scope(role: str, region: str) -> str | None:
+        """区域负责人只能看本区域；医学审核员和全局管理员跨区。"""
+        if role == "regional_lead":
+            return region
+        return None
+
+    @staticmethod
+    def require_signal_actor(role: str) -> None:
+        if role not in {"medical_reviewer", "global_admin"}:
+            raise ApiError(403, "signal_forbidden", "只有医学审核员或全局管理员可以处置安全信号")
+
+    def _load_valid_cases(self, conn: sqlite3.Connection) -> list[dict[str, Any]]:
+        return [dict(r) for r in conn.execute("SELECT * FROM cases WHERE status!='merged' ORDER BY id")]
+
+    def scan_signals(self, actor: str, role: str) -> dict[str, Any]:
+        """按产品和事件词归并有效案例：命中规则的组合建立信号并同步证据。
+
+        重复检查不会产生第二份：同一 (产品,事件词) 只有一条信号，
+        已合并来源案例 status='merged'，只跟随目标案例，不参与计数。
+        """
+        self.require_signal_actor(role)
+        created: list[dict[str, Any]] = []
+        updated: list[int] = []
+        with self.repo.tx() as conn:
+            cases = self._load_valid_cases(conn)
+            groups = [g for g in signal_rules.build_groups(cases) if g["matched_rules"]]
+            for group in groups:
+                now = iso()
+                existing = conn.execute(
+                    "SELECT * FROM signals WHERE product_key=? AND event_key=?",
+                    (group["product_key"], group["event_key"]),
+                ).fetchone()
+                group_cases = sorted(group["cases"], key=lambda c: c["id"])
+                if existing is None:
+                    signal_no = self.signals.next_signal_no(conn, utcnow().year)
+                    cursor = conn.execute(
+                        """INSERT INTO signals(signal_no,product,event_term,product_key,event_key,
+                           case_count,serious_count,fatal_count,regions_json,rules_json,status,
+                           created_by,created_at,updated_at)
+                           VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                        (signal_no, group["product"], group["event_term"], group["product_key"],
+                         group["event_key"], group["case_count"], group["serious_count"],
+                         group["fatal_count"], json.dumps(group["regions"], ensure_ascii=False),
+                         json.dumps(signal_rules.rule_snapshot(group["matched_rules"]), ensure_ascii=False),
+                         "open", actor, now, now),
+                    )
+                    signal_id = cursor.lastrowid
+                    for case in group_cases:
+                        conn.execute(
+                            """INSERT INTO signal_evidence(signal_id,case_id,region,serious,fatal,added_at)
+                               VALUES(?,?,?,?,?,?)""",
+                            (signal_id, case["id"], case["region"], int(bool(case["serious"])),
+                             int(bool(case["fatal"])), now),
+                        )
+                    Repository.audit(conn, actor, role, "signal_created",
+                                     {"signal_no": signal_no, "matched_rules": group["matched_rules"],
+                                      "case_count": group["case_count"], "fatal_count": group["fatal_count"]},
+                                     signal_id=signal_id)
+                    created.append(self.signals.serialize(conn.execute(
+                        "SELECT * FROM signals WHERE id=?", (signal_id,)).fetchone()))
+                else:
+                    signal_id = existing["id"]
+                    stats = self.signals.reconcile_evidence(conn, signal_id, group_cases)
+                    conn.execute("UPDATE signals SET rules_json=?,updated_at=? WHERE id=?",
+                                 (json.dumps(signal_rules.rule_snapshot(group["matched_rules"]), ensure_ascii=False),
+                                  iso(), signal_id))
+                    Repository.audit(conn, actor, role, "signal_evidence_refreshed",
+                                     {"matched_rules": group["matched_rules"], **stats}, signal_id=signal_id)
+                    updated.append(signal_id)
+        return {"created": created, "created_count": len(created), "updated_count": len(updated)}
+
+    def list_signals(self, role: str, region: str) -> dict[str, Any]:
+        scope = self.signal_region_scope(role, region)
+        with self.repo.tx() as conn:
+            signals = self.signals.list_signals(conn, scope)
+            now = iso()
+            for signal in signals:
+                actions = self.signals.actions(conn, signal["id"], now)
+                signal["open_action_count"] = sum(1 for a in actions if a["status"] != "completed")
+                signal["overdue"] = any(a["overdue"] for a in actions)
+            overdue_count = sum(1 for s in signals if s["overdue"])
+        return {"signals": signals, "overdue_count": overdue_count, "server_time": now}
+
+    def get_signal(self, signal_id: int, role: str, region: str) -> dict[str, Any]:
+        scope = self.signal_region_scope(role, region)
+        conn = self.repo.conn
+        signal = self.signals.serialize(self.signals.get(conn, signal_id))
+        if scope and scope not in signal["regions"]:
+            raise ApiError(403, "signal_forbidden", "只能查看本区域涉及的信号")
+        actions = self.signals.actions(conn, signal_id)
+        signal["open_action_count"] = sum(1 for a in actions if a["status"] != "completed")
+        signal["overdue"] = any(a["overdue"] for a in actions)
+        return {
+            "signal": signal,
+            "evidence": self.signals.evidence(conn, signal_id, scope),
+            "evidence_total": len(self.signals.evidence(conn, signal_id)),
+            "decisions": self.signals.decisions(conn, signal_id),
+            "actions": actions,
+            "audit": [dict(r) for r in conn.execute(
+                "SELECT actor,role,action,detail_json,created_at FROM audit_log WHERE signal_id=? ORDER BY id",
+                (signal_id,))],
+        }
+
+    def decide_signal(self, signal_id: int, actor: str, role: str, region: str, body: dict[str, Any]) -> dict[str, Any]:
+        self.require_signal_actor(role)
+        decision = str(body.get("decision", "")).strip()
+        rationale = str(body.get("rationale", "")).strip()
+        if decision not in {"confirmed", "rejected"}:
+            raise ApiError(400, "invalid_decision", "decision 必须是 confirmed 或 rejected")
+        if not rationale:
+            raise ApiError(400, "rationale_required", "确认或驳回必须填写判定依据")
+        now = iso()
+        with self.repo.tx() as conn:
+            signal = self.signals.get(conn, signal_id)
+            scope = self.signal_region_scope(role, region)
+            if scope and scope not in json.loads(signal["regions_json"]):
+                raise ApiError(403, "signal_forbidden", "不能处置非本区域信号")
+            if signal["status"] in {"confirmed", "rejected"}:
+                raise ApiError(409, "signal_decided", f"信号已{('确认' if signal['status']=='confirmed' else '驳回')}，不能重复判定")
+            conn.execute(
+                "UPDATE signals SET status=?,rationale=?,decided_by=?,decided_at=?,updated_at=? WHERE id=?",
+                (decision, rationale, actor, now, now, signal_id),
+            )
+            conn.execute(
+                "INSERT INTO signal_decisions(signal_id,decision,rationale,reviewer,created_at) VALUES(?,?,?,?,?)",
+                (signal_id, decision, rationale, actor, now),
+            )
+            Repository.audit(conn, actor, role, f"signal_{decision}", {"rationale": rationale}, signal_id=signal_id)
+
+        # 确认时可同时登记首条措施（measure/owner/due_at 可选）
+        if decision == "confirmed" and str(body.get("measure", "")).strip():
+            self.register_action(signal_id, actor, role, region, body, skip_permission=True)
+        return {"signal": self.signals.serialize(self.repo.conn.execute(
+            "SELECT * FROM signals WHERE id=?", (signal_id,)).fetchone())}
+
+    def register_action(self, signal_id: int, actor: str, role: str, region: str,
+                        body: dict[str, Any], skip_permission: bool = False) -> dict[str, Any]:
+        if not skip_permission:
+            self.require_signal_actor(role)
+        measure = str(body.get("measure", "")).strip()
+        owner = str(body.get("owner", "")).strip()
+        due_at = str(body.get("due_at", "")).strip()
+        if not measure or not owner or not due_at:
+            raise ApiError(400, "missing_fields", "登记措施必须提供 measure、owner 和 due_at")
+        due = parse_time(due_at)
+        now = iso()
+        with self.repo.tx() as conn:
+            signal = self.signals.get(conn, signal_id)
+            scope = self.signal_region_scope(role, region)
+            if scope and scope not in json.loads(signal["regions_json"]):
+                raise ApiError(403, "signal_forbidden", "不能为非本区域信号登记措施")
+            if signal["status"] != "confirmed":
+                raise ApiError(409, "signal_not_confirmed", "只有已确认的信号才能登记措施")
+            cur = conn.execute(
+                """INSERT INTO signal_actions(signal_id,measure,owner,due_at,status,created_by,created_at)
+                   VALUES(?,?,?,?, 'registered',?,?)""",
+                (signal_id, measure, owner, iso(due), actor, now),
+            )
+            action_id = cur.lastrowid
+            Repository.audit(conn, actor, role, "signal_action_registered",
+                             {"action_id": action_id, "measure": measure, "owner": owner, "due_at": iso(due)},
+                             signal_id=signal_id)
+            action = dict(conn.execute("SELECT * FROM signal_actions WHERE id=?", (action_id,)).fetchone())
+        action["overdue"] = int(action["due_at"] < now)
+        return {"action": action}
+
+    def complete_action(self, action_id: int, actor: str, role: str, region: str, body: dict[str, Any]) -> dict[str, Any]:
+        self.require_signal_actor(role)
+        now = parse_time(body.get("completed_at"), utcnow())
+        with self.repo.tx() as conn:
+            row = self.signals.action(conn, action_id)
+            signal = self.signals.get(conn, row["signal_id"])
+            scope = self.signal_region_scope(role, region)
+            if scope and scope not in json.loads(signal["regions_json"]):
+                raise ApiError(403, "signal_forbidden", "不能处理非本区域信号措施")
+            if row["status"] == "completed":
+                action = dict(row)
+            else:
+                conn.execute(
+                    "UPDATE signal_actions SET status='completed',completed_at=?,completed_by=? WHERE id=?",
+                    (iso(now), actor, action_id),
+                )
+                Repository.audit(conn, actor, role, "signal_action_completed",
+                                 {"action_id": action_id}, signal_id=row["signal_id"])
+                action = dict(conn.execute("SELECT * FROM signal_actions WHERE id=?", (action_id,)).fetchone())
+        action["overdue"] = 0
+        return {"action": action}
+
+    def overdue_signals(self, role: str, region: str) -> dict[str, Any]:
+        listing = self.list_signals(role, region)
+        overdue = [s for s in listing["signals"] if s["overdue"]]
+        return {"signals": overdue, "count": len(overdue), "server_time": listing["server_time"]}
 
     def state(self, role: str, region: str) -> dict[str, Any]:
         cases = self.list_cases(role, region, {})
-        return {"cases": cases, "overdue": self.overdue(role, region), "server_time": iso()}
+        payload: dict[str, Any] = {"cases": cases, "overdue": self.overdue(role, region), "server_time": iso()}
+        if role != "reporter":
+            payload["signals"] = self.list_signals(role, region)
+        return payload
 
 
 def json_response(handler: BaseHTTPRequestHandler, status: int, payload: Any) -> None:
@@ -437,7 +645,13 @@ class Handler(BaseHTTPRequestHandler):
             return 200, {"cases": self.service.list_cases(role, region, query)}
         if path == "/api/overdue":
             return 200, {"reports": self.service.overdue(role, region)}
+        if path == "/api/signals":
+            return 200, self.service.list_signals(role, region)
+        if path == "/api/signals/overdue":
+            return 200, self.service.overdue_signals(role, region)
         parts = [part for part in path.split("/") if part]
+        if len(parts) == 3 and parts[:2] == ["api", "signals"] and parts[2].isdigit():
+            return 200, self.service.get_signal(int(parts[2]), role, region)
         if len(parts) == 3 and parts[:2] == ["api", "cases"] and parts[2].isdigit():
             return 200, self.service.get_case(int(parts[2]), role, region)
         raise ApiError(404, "not_found", "接口不存在")
@@ -448,7 +662,19 @@ class Handler(BaseHTTPRequestHandler):
             return 201, self.service.create_case(actor, role, region, body)
         if path == "/api/escalate-overdue":
             return 200, self.service.escalate_overdue(actor, role, region)
+        if path == "/api/signals/scan":
+            return 200, self.service.scan_signals(actor, role)
+        if path.startswith("/api/signal-actions/"):
+            parts = [part for part in path.split("/") if part]
+            if len(parts) == 4 and parts[:2] == ["api", "signal-actions"] and parts[2].isdigit() and parts[3] == "complete":
+                return 200, self.service.complete_action(int(parts[2]), actor, role, region, body)
         parts = [part for part in path.split("/") if part]
+        if len(parts) == 4 and parts[:2] == ["api", "signals"] and parts[2].isdigit():
+            signal_id, action = int(parts[2]), parts[3]
+            if action == "decision":
+                return 200, self.service.decide_signal(signal_id, actor, role, region, body)
+            if action == "actions":
+                return 201, self.service.register_action(signal_id, actor, role, region, body)
         if len(parts) == 4 and parts[:2] == ["api", "cases"] and parts[2].isdigit():
             case_id, action = int(parts[2]), parts[3]
             if action == "followups":
